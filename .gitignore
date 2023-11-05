@@ -2,3 +2,5 @@ secrets.json
 .env
 *.log
 notes.txt
+pages/*
+config.py
