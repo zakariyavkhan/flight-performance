@@ -1,7 +1,7 @@
 # from config import DevelopmentConfig, ProductionConfig
 from dotenv import dotenv_values
-from datetime import datetime, timezone
-import requests, logging, sys
+from datetime import datetime, timedelta, timezone
+import requests, logging
 from bs4 import BeautifulSoup
 from pymongo import MongoClient
 
@@ -48,18 +48,24 @@ def get_flights(url, table_id):
     return table
 
 
-def parse_flights(table):
+def parse_flights(table, date=datetime.now(), delayed=False):
     """
     Parses the table of flights
     :caveat: this function breaks on every Jan 1st for delayed flights
     :param table: the table of flights
+    :param date: the date of the flights, format: YYYY-MM-DD; defaults to today
+    :param delayed: 
     :return: list of flights
     :rtype: [{"flight_num":"WS197",}, {}, ...]
     """
+    if isinstance(date, datetime):
+        date = date.strftime("%a %b %d")
+    else:
+        date = datetime.strptime(date, "%Y-%m-%d").strftime("%a %b %d")
+
     flights = []
     for row in table:
         flight = {}
-        today = datetime.now().strftime("%a %b %d")
         scheduled_time = row.find("div").text.strip()
         # only delayed flight have this div
         actual_time_div = row.find("div", class_="bubble")
@@ -67,26 +73,36 @@ def parse_flights(table):
             actual_time = actual_time_div.find_all("div")[1].text.strip()
         else:
             actual_time = None
-        flight["gate"] = row.find("td", class_="ft-gate").text.strip()
-        flight["airline"] = row.find("span").text.strip()
-        flight["src_dest"] = row.find_all("td")[2].text.strip()
-        flight["flight_num"] = row.find_all("td")[1].text.strip()
 
-        # timestamps in UTC because that's what MongoDB uses
-        flight["scheduled_timestamp"] = (
-            (datetime.strptime(today + " " + scheduled_time, "%a %b %d %I:%M %p"))
-            .replace(year=datetime.now().year)
-            .astimezone(timezone.utc)
-        )
+        try:
+            flight["gate"] = row.find("td", class_="ft-gate").text.strip()
+            flight["airline"] = row.find("span").text.strip()
+            flight["src_dest"] = row.find_all("td")[2].text.strip()
+            flight["flight_num"] = row.find_all("td")[1].text.strip()
+
+        # if AttributeError, skip this flight
+        except AttributeError:
+            continue
+
         if actual_time:
             # if the flight is delayed past 11:59pm, due to UTC conversion
             # the actual_timestamp will be incorrect. gets fixed on next day
             flight["actual_timestamp"] = (
-                (datetime.strptime(today + " " + actual_time, "%a %b %d %I:%M %p"))
+                (datetime.strptime(date + " " + actual_time, "%a %b %d %I:%M %p"))
                 .replace(year=datetime.now().year)
                 .astimezone(timezone.utc)
             )
 
+        if delayed:
+            date = (datetime.strptime(date, "%a %b %d") - timedelta(days=1)).strftime("%a %b %d")
+            
+        # timestamps in UTC because that's what MongoDB uses
+        flight["scheduled_timestamp"] = (
+            (datetime.strptime(date + " " + scheduled_time, "%a %b %d %I:%M %p"))
+            .replace(year=datetime.now().year)
+            .astimezone(timezone.utc)
+        )
+        
         # one of the advantages of MongoDB is flexibile schema
         # i may want to take advantage of that by only storing keys with not null values
         if "departure" in row["class"]:
@@ -104,6 +120,7 @@ def add_flights(conn, flights):
     Adds the flights to the database
     :param conn: connection to the flights collection
     :param flights: the list of flights to add
+    :return: log message
     """
     try:
         results = conn.insert_many(flights)
@@ -119,9 +136,9 @@ def update_flights(conn, delayed_flights):
     Updates the flights collection with the new flights
     :caveat: if delayed_flights and DB is empty, the wrong flight will be updated
     :param conn: connection to the flights collection
-    :param flights: the list of flights to update
+    :param delayed_flights: the list of flights to update
+    :return: log message
     """
-    delayed_flights = parse_flights(delayed_flights)
     # for flight in delayed_flights, find the corresponding flight
     # in flights_collection by (scheduled_timestamp, flight_num)
     # and update it's actual_timestamp
@@ -141,17 +158,6 @@ def update_flights(conn, delayed_flights):
     return f"; Updated {updated} documents"
 
 
-def save_page():
-    """
-    Saves the page to a file for testing purposes
-    """
-    page = requests.get(config["URL"])
-    soup = BeautifulSoup(page.content, "html.parser")
-    filename = f"pages/{datetime.now().strftime('%Y-%m-%d')}.html"
-    with open(filename, "w") as f:
-        f.write(str(soup))
-
-
 def main():
     # # can i configure the output file of the logger after creating it?
     # if "dev" in sys.argv:
@@ -159,19 +165,35 @@ def main():
     # else:
     #     config = ProductionConfig()
 
-    save_page()
-
     delayed_flights = get_flights(config["URL"], "flightsYesterday")
     flight_table = get_flights(config["URL"], "flightsToday")
     flights = parse_flights(flight_table)
+    
+    # save page to html
+    with open(f"html/{datetime.now().strftime('%Y-%m-%d')}.html", "w") as f:
+        f.write(requests.get(config["URL"]).text)
 
+    # save todays parsed flights
+    with open("pages/flight_data.py", "a") as f:
+        f.write(f"flights_{datetime.now().strftime('%Y%m%d')} = " + str(flights) + "\n")
+
+    # get connection to the database
     client = get_client()
     db = client[config["DB_NAME"]]
     flights_collection = db[config["COLLECTION"]]
-
+    
+    # commit the flights to the database
     log_msg = add_flights(flights_collection, flights)
+    
+    # parse, save, and commit the delayed flights to the database
     if delayed_flights:
+        delayed_flights = parse_flights(delayed_flights, delayed=True)
         log_msg += update_flights(flights_collection, delayed_flights)
+        with open("pages/delayed_flight_data.py", "a") as f:
+            f.write(
+                f"flights_{datetime.now().strftime('%Y%m%d')} = "
+                + str(parse_flights(delayed_flights)) + "\n"
+            )
 
     LOGGER.info(log_msg)
     client.close()

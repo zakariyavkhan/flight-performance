@@ -2,5 +2,9 @@ secrets.json
 .env
 *.log
 notes.txt
-pages/*
+pages
+html
 config.py
+__pycache__
+page_parser.py
+mongo_data_loader.py
