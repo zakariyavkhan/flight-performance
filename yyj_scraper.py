@@ -54,27 +54,29 @@ def parse_flights(table, date=datetime.now(), delayed=False):
     :caveat: this function breaks on every Jan 1st for delayed flights
     :param table: the table of flights
     :param date: the date of the flights, format: YYYY-MM-DD; defaults to today
-    :param delayed: 
+    :param delayed: bool flag for "flightsYesterday"
     :return: list of flights
     :rtype: [{"flight_num":"WS197",}, {}, ...]
     """
+    fmt = "%a %b %d"
+    
     if isinstance(date, datetime):
-        date = date.strftime("%a %b %d")
+        date = date.strftime(fmt)
     else:
-        date = datetime.strptime(date, "%Y-%m-%d").strftime("%a %b %d")
+        date = datetime.strptime(date, "%Y-%m-%d").strftime(fmt)
 
     flights = []
+    
     for row in table:
         flight = {}
-        scheduled_time = row.find("div").text.strip()
-        # only delayed flight have this div
-        actual_time_div = row.find("div", class_="bubble")
-        if actual_time_div:
-            actual_time = actual_time_div.find_all("div")[1].text.strip()
-        else:
-            actual_time = None
-
         try:
+            scheduled_time = row.find("div").text.strip()
+            # only delayed flight have this div
+            actual_time_div = row.find("div", class_="bubble")
+            if actual_time_div:
+                actual_time = actual_time_div.find_all("div")[1].text.strip()
+            else:
+                actual_time = None
             flight["gate"] = row.find("td", class_="ft-gate").text.strip()
             flight["airline"] = row.find("span").text.strip()
             flight["src_dest"] = row.find_all("td")[2].text.strip()
@@ -94,15 +96,15 @@ def parse_flights(table, date=datetime.now(), delayed=False):
             )
 
         if delayed:
-            date = (datetime.strptime(date, "%a %b %d") - timedelta(days=1)).strftime("%a %b %d")
-            
+            date = (datetime.strptime(date, fmt) - timedelta(days=1)).strftime(fmt)
+
         # timestamps in UTC because that's what MongoDB uses
         flight["scheduled_timestamp"] = (
             (datetime.strptime(date + " " + scheduled_time, "%a %b %d %I:%M %p"))
             .replace(year=datetime.now().year)
             .astimezone(timezone.utc)
         )
-        
+
         # one of the advantages of MongoDB is flexibile schema
         # i may want to take advantage of that by only storing keys with not null values
         if "departure" in row["class"]:
@@ -168,7 +170,7 @@ def main():
     delayed_flights = get_flights(config["URL"], "flightsYesterday")
     flight_table = get_flights(config["URL"], "flightsToday")
     flights = parse_flights(flight_table)
-    
+
     # save page to html
     with open(f"html/{datetime.now().strftime('%Y-%m-%d')}.html", "w") as f:
         f.write(requests.get(config["URL"]).text)
@@ -181,18 +183,20 @@ def main():
     client = get_client()
     db = client[config["DB_NAME"]]
     flights_collection = db[config["COLLECTION"]]
-    
+
     # commit the flights to the database
     log_msg = add_flights(flights_collection, flights)
-    
-    # parse, save, and commit the delayed flights to the database
+
     if delayed_flights:
+        # commit delayed flights to db
         delayed_flights = parse_flights(delayed_flights, delayed=True)
         log_msg += update_flights(flights_collection, delayed_flights)
+        # save delayed parsed flights
         with open("pages/delayed_flight_data.py", "a") as f:
             f.write(
                 f"flights_{datetime.now().strftime('%Y%m%d')} = "
-                + str(parse_flights(delayed_flights)) + "\n"
+                + str(parse_flights(delayed_flights))
+                + "\n"
             )
 
     LOGGER.info(log_msg)
